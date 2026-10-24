@@ -32,13 +32,40 @@ def now(): return datetime.now().astimezone().isoformat(timespec='seconds')
 def secret(k):
     try: return st.secrets.get(k,os.getenv(k,''))
     except Exception: return os.getenv(k,'')
-def extract(name,raw):
+def extract(name, raw):
+    """Extract CV text robustly from PDF, DOCX (including tables), or TXT."""
+    suffix = Path(name).suffix.lower()
     try:
-        if name.lower().endswith('.pdf') and pdfplumber:
-            with pdfplumber.open(io.BytesIO(raw)) as p: return '\n'.join(x.extract_text() or '' for x in p.pages)
-        if name.lower().endswith('.docx') and Document: return '\n'.join(x.text for x in Document(io.BytesIO(raw)).paragraphs)
-        if name.lower().endswith('.txt'): return raw.decode('utf-8',errors='ignore')
-    except Exception: pass
+        if suffix == '.pdf':
+            if not pdfplumber:
+                return ''
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                chunks = []
+                for page in pdf.pages:
+                    chunks.append(page.extract_text(layout=False) or '')
+                return '\n'.join(chunks).strip()
+        if suffix == '.docx':
+            if not Document:
+                return ''
+            doc = Document(io.BytesIO(raw))
+            chunks = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+            # Many CV templates place experience and education inside tables.
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells if cell.text and cell.text.strip()]
+                    if cells:
+                        chunks.append(' | '.join(cells))
+            for section in doc.sections:
+                for part in (section.header, section.footer):
+                    for para in part.paragraphs:
+                        if para.text and para.text.strip():
+                            chunks.append(para.text.strip())
+            return '\n'.join(chunks).strip()
+        if suffix == '.txt':
+            return raw.decode('utf-8-sig', errors='ignore').strip()
+    except Exception as exc:
+        # Keep the UI usable; the caller will show a clear message if text is empty.
+        st.session_state['cv_extract_error'] = f'{type(exc).__name__}: {exc}'
     return ''
 def profile_from(text):
     t=text.lower()
@@ -164,12 +191,43 @@ if page=='CV & Profile':
         else:
             raw=f.getvalue(); digest=hashlib.sha256(raw).hexdigest(); existing=df('SELECT id FROM cvs WHERE hash=?',(digest,))
             if existing.empty:
-                safe=re.sub(r'[^A-Za-z0-9._-]+','_',f.name); path=DATA/'cv_versions'/f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{safe}';path.write_bytes(raw)
+                safe=re.sub(r'[^A-Za-z0-9._-]+','_',f.name)
+                path=DATA/'cv_versions'/f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{safe}'
+                path.write_bytes(raw)
                 text=extract(f.name,raw)
                 run('INSERT INTO cvs(filename,path,label,uploaded,text,hash) VALUES(?,?,?,?,?,?)',(f.name,str(path),label,now(),text,digest))
-            else: text=df('SELECT text FROM cvs WHERE id=?',(int(existing.iloc[0,0]),)).iloc[0,0]
-            if not text.strip(): st.error('CV stored, but text extraction failed. Try a text-based PDF or DOCX.')
-            else: save_profile(profile_from(text)); st.success('CV saved and search profile extracted. Review the profile below.'); st.rerun()
+                cv_id=int(df('SELECT id FROM cvs WHERE hash=?',(digest,)).iloc[0,0])
+            else:
+                cv_id=int(existing.iloc[0,0])
+                saved=df('SELECT text,path FROM cvs WHERE id=?',(cv_id,)).iloc[0]
+                text=str(saved['text'] or '')
+                # Important: retry extraction for files previously stored with empty text.
+                if not text.strip():
+                    text=extract(f.name,raw)
+                    run('UPDATE cvs SET text=?,label=?,uploaded=? WHERE id=?',(text,label,now(),cv_id))
+            if not text.strip():
+                detail=st.session_state.pop('cv_extract_error','')
+                st.error('The file was stored, but no readable CV text was extracted. Other CV-dependent functions are paused until text is available.')
+                if detail: st.caption('Extraction detail: '+detail)
+                if f.name.lower().endswith('.pdf'):
+                    st.info('If this PDF is scanned, save/export it as a text-searchable PDF or upload a DOCX/TXT version. You can also use the text box below.')
+                st.session_state['cv_manual_text_mode']=True
+            else:
+                save_profile(profile_from(text))
+                st.session_state['cv_manual_text_mode']=False
+                st.success(f'CV saved and extracted ({len(text):,} characters). Search profile created. Review the profile below.')
+                st.rerun()
+    if st.session_state.get('cv_manual_text_mode', False):
+        st.markdown('**Recovery option: paste the CV text here**')
+        manual_text=st.text_area('CV text',height=240,placeholder='Open your CV, select all text, copy, and paste it here.')
+        if st.button('Create profile from pasted text'):
+            if len(manual_text.strip()) < 100:
+                st.error('Please paste at least 100 characters of CV text.')
+            else:
+                save_profile(profile_from(manual_text.strip()))
+                st.success('Profile created from pasted CV text. You can now use the job scanner.')
+                st.session_state['cv_manual_text_mode']=False
+                st.rerun()
     cvs=df('SELECT id,filename,label,uploaded FROM cvs ORDER BY id DESC')
     if not cvs.empty:
         st.dataframe(cvs,use_container_width=True,hide_index=True)
