@@ -184,6 +184,8 @@ st.caption('CV-driven automatic job discovery • India • Middle East • Afri
 page=st.sidebar.radio('Navigation',['Dashboard & Scan','CV & Profile','Shortlist','Scan History','Setup'])
 p=get_profile()
 if page=='CV & Profile':
+    if st.session_state.pop('profile_saved_notice', False):
+        st.success('Saved successfully. Your selected positions, industries, capabilities, markets and filters are now active.')
     st.subheader('Upload CV and extract search profile')
     f=st.file_uploader('CV file (PDF, DOCX, TXT)',type=['pdf','docx','txt']); label=st.text_input('CV version label',value=f'CV {date.today().isoformat()}')
     if st.button('Save CV and extract profile'):
@@ -225,8 +227,8 @@ if page=='CV & Profile':
                 st.error('Please paste at least 100 characters of CV text.')
             else:
                 save_profile(profile_from(manual_text.strip()))
-                st.success('Profile created from pasted CV text. You can now use the job scanner.')
                 st.session_state['cv_manual_text_mode']=False
+                st.session_state['profile_saved_notice']=True
                 st.rerun()
     cvs=df('SELECT id,filename,label,uploaded FROM cvs ORDER BY id DESC')
     if not cvs.empty:
@@ -244,18 +246,34 @@ if page=='CV & Profile':
             days=st.slider('Maximum vacancy age (days)',1,90,int(p['days']))
             ok=st.form_submit_button('Save profile')
         if ok:
-            p.update(roles=roles,industries=industries,skills=skills,markets=markets,experience_years=exp,min_required=minreq,days=days);save_profile(p);st.success('Profile saved.');st.rerun()
+            p.update(roles=roles,industries=industries,skills=skills,markets=markets,experience_years=exp,min_required=minreq,days=days)
+            save_profile(p)
+            st.session_state['profile_saved_notice']=True
+            st.rerun()
     else: st.info('Upload your CV to begin.')
 elif page=='Dashboard & Scan':
     if not p: st.warning('Open CV & Profile and upload your CV first.');st.stop()
     jobs=df('SELECT * FROM jobs ORDER BY score DESC,posted DESC')
     a,b,c,d=st.columns(4);a.metric('Matching jobs',len(jobs));b.metric('Markets',len(p['markets']));c.metric('Experience filter',f"{p['min_required']}+ years");d.metric('Posting window',f"{p['days']} days")
     st.write('Every scan searches configured sources, excludes postings older than the selected window, re-scores matches, and refreshes saved listings.')
-    if st.button('🔄 Scan for new and refreshed jobs',type='primary',use_container_width=True):
-        with st.spinner('Scanning available job sources and matching your CV profile…'): n,notes,qs=scan(p)
-        st.success(f'Scan complete: {n} matching listings found or refreshed.');st.write('Search queries:',', '.join(qs))
-        for note in dict.fromkeys(notes): st.caption(note)
-        st.rerun()
+    if st.button('🔄 Scan for new and refreshed jobs', type='primary', use_container_width=True):
+        try:
+            with st.spinner('Scanning available job sources and matching your CV profile…'):
+                n, notes, qs = scan(p)
+            st.session_state['last_scan_notice'] = f'Scan complete: {n} matching listings found or refreshed.'
+            st.session_state['last_scan_queries'] = ', '.join(qs)
+            st.session_state['last_scan_notes'] = list(dict.fromkeys(notes))
+            st.rerun()
+        except Exception as exc:
+            st.error(f'The scan failed: {type(exc).__name__}: {exc}')
+            st.info('Check Setup for API keys and review the Streamlit app logs for the full traceback.')
+    scan_notice = st.session_state.pop('last_scan_notice', None)
+    if scan_notice:
+        st.success(scan_notice)
+        if st.session_state.get('last_scan_queries'):
+            st.write('Search queries:', st.session_state['last_scan_queries'])
+        for note in st.session_state.get('last_scan_notes', []):
+            st.caption(note)
     hist=df('SELECT at,count FROM scans ORDER BY id DESC LIMIT 1')
     if not hist.empty: st.caption(f"Last scan: {hist.iloc[0]['at']} • matches: {hist.iloc[0]['count']}")
     jobs=df('SELECT * FROM jobs ORDER BY score DESC,posted DESC')
@@ -276,11 +294,19 @@ elif page=='Dashboard & Scan':
         st.download_button('Export matching jobs CSV',v.to_csv(index=False).encode(),file_name='matching_jobs.csv',mime='text/csv')
 elif page=='Shortlist':
     s=df('SELECT s.status,s.notes,s.updated,j.company,j.role,j.location,j.market,j.score,j.posted,j.url FROM shortlist s LEFT JOIN jobs j ON s.job_key=j.job_key ORDER BY s.updated DESC')
-    st.subheader('Shortlisted jobs');st.dataframe(s,use_container_width=True,hide_index=True) if not s.empty else st.info('Shortlist jobs from the dashboard.')
+    st.subheader('Shortlisted jobs')
+    if not s.empty:
+        st.dataframe(s, use_container_width=True, hide_index=True)
+    else:
+        st.info('No shortlisted jobs yet. Open Dashboard & Scan and use the Shortlist button on a job.')
     if not s.empty:
         st.download_button('Export shortlist CSV',s.to_csv(index=False).encode(),file_name='shortlist.csv',mime='text/csv')
 elif page=='Scan History':
-    h=df('SELECT * FROM scans ORDER BY id DESC LIMIT 100');st.dataframe(h,use_container_width=True,hide_index=True) if not h.empty else st.info('No scans yet.')
+    h=df('SELECT * FROM scans ORDER BY id DESC LIMIT 100')
+    if not h.empty:
+        st.dataframe(h, use_container_width=True, hide_index=True)
+    else:
+        st.info('No scans yet. Open Dashboard & Scan and run a scan first.')
 elif page=='Setup':
     st.subheader('Job source configuration')
     st.markdown('**Arbeitnow** is attempted without a key, but coverage in your target markets may be limited. Configure Adzuna and Jooble for broader discovery.')
