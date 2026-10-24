@@ -1,72 +1,40 @@
-Executive Job Screener + CV Manager + Application Centre
-A Streamlit MVP for managing senior leadership job opportunities, storing CV versions,
-scoring role fit, preparing application materials, and tracking application progress.
-Included
-- app.py — Streamlit application
-- requirements.txt — Python dependencies
-- app.py.txt — copy-friendly version of the Python source
-Important limitations
-This MVP does not scrape LinkedIn, Indeed, or employer websites, and it does not
-bypass login, CAPTCHA, or application-site controls. It can prepare an application,
-download the selected CV and cover letter, open an employer's application page, and
-track whether you have applied. Actual direct submission requires an authorized API or
-supported application integration.
-
-The default database and CV storage are local. On Streamlit Community Cloud, local
-storage may be ephemeral. For durable private storage and multi-device use, connect a
-managed database (for example, Supabase/PostgreSQL) and private object storage.
+Executive Job Screener — Automatic CV-driven Job Discovery
+This version extracts a draft profile from an uploaded CV, searches configured job sources, filters listings by age and explicit experience requirements, scores matches, and displays them on the dashboard.
+Your configured search rules
+- Markets: India, Middle East, Africa
+- Posting age: up to 90 days
+- Exclude vacancies that explicitly require fewer than 15 years of experience
+- Position and industry terms are extracted from the CV and can be edited in CV & Profile
+- Match by leadership role, industry, responsibilities, P&L, sales, operations, leadership, transformation and market
+Files
+- app.py: complete Streamlit app
+- app.py.txt: same code in text format for copying
+- requirements.txt: Python dependencies
 Run locally
-1. Install Python 3.10 or newer.
-2. Extract the project folder.
-3. Open a terminal in that folder.
-4. Create and activate a virtual environment (optional but recommended):
-   python -m venv .venv
-   # Windows:
-   .venv\Scripts\activate
-   # macOS/Linux:
-   source .venv/bin/activate
-5. Install dependencies:
-   pip install -r requirements.txt
-6. Start the app:
-   streamlit run app.py
-Deploy on Streamlit Community Cloud
-1. Create a private GitHub repository for this project.
-2. Add app.py, requirements.txt, and this README.
-3. In Streamlit Community Cloud, create an app from the repository.
-4. Set the main file path to app.py.
-5. Deploy.
-Do not commit your CV, database, secrets, or private application information to GitHub.
-Add a .gitignore containing at least:
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+Deploy
+Push app.py and requirements.txt to GitHub and set Streamlit's main file to app.py. Upload the CV in CV & Profile, review the extracted profile, then click Scan for new and refreshed jobs on the dashboard.
+Job sources
+- Arbeitnow: public API, no key required. Coverage in India, Middle East and Africa may be limited.
+- Adzuna: API credentials required. Add to Streamlit Cloud → app Settings → Secrets:
+ADZUNA_APP_ID = "your_app_id"
+ADZUNA_APP_KEY = "your_app_key"
+- Jooble: API key required:
+JOOBLE_API_KEY = "your_jooble_key"
+This code maps India to Adzuna's India market, Middle East to UAE, and Africa to South Africa as representative countries. Broader regional coverage requires country-by-country queries and supported API access. The app cannot guarantee all available vacancies because job-source coverage and API plans vary.
+Filters and matching
+- Listings older than 90 days are excluded; listings without a reliable date are excluded too.
+- If a job explicitly requires fewer than 15 years of experience, it is excluded. If no years are stated, the app cannot know the employer's minimum and ranks the job by profile fit.
+- Scores are heuristic and should be reviewed, not treated as guarantees.
+- Click Scan to refresh. Continuous scanning requires a separate scheduler; Streamlit Community Cloud does not run a scan continuously while the app sleeps.
+Privacy and persistence
+Do not commit your CV, job database or API secrets to a public GitHub repository. Default local storage may be ephemeral on Streamlit Cloud. For reliable CV history, use a managed database and private object storage. Add to .gitignore:
 data/
 .venv/
 __pycache__/
 .streamlit/secrets.toml
-Workflow
-1. Open CV Manager and upload your CV. Each upload is saved as a version.
-2. Add jobs manually or import a CSV in Jobs.
-3. Review the role-fit score and shortlist status.
-4. In Application Centre, select a job and CV version.
-5. Review the generated cover letter, download materials, and open the employer's
-   application page where required.
-6. Mark the application status and record follow-up dates.
-7. Export the job and application trackers from Settings or Application Centre.
-CSV import format
-Required fields:
-- company
-- role
-Optional fields:
-- location
-- region
-- industry
-- description
-- job_url
-- salary
-- posted_date
-Storage configuration
-By default, files are stored under data/ and SQLite is used. You may configure local
-paths with environment variables:
-- APP_DATA_DIR
-- APP_DB_PATH
-For production, add authentication, access controls, managed persistence, encrypted
-storage, backups, and retention controls before uploading sensitive CVs or application
-records.
+This app prepares links and tracks jobs; it does not bypass third-party login/CAPTCHA or automatically submit job applications.
