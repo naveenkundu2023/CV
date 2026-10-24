@@ -1,427 +1,233 @@
-"""
-Executive Job Screener + CV Manager + Application Centre
-Streamlit MVP.
-
-Notes:
-- Stores data in SQLite at ./data/job_screener.db by default.
-- Local SQLite/filesystem storage may be ephemeral on Streamlit Cloud. For persistent
-  multi-device use, configure a persistent database/object store (e.g. Supabase/S3).
-- Does not scrape sites or bypass login, CAPTCHA, or platform controls.
-- Supports application preparation, downloads, application tracking, and email drafts.
-"""
-
-from __future__ import annotations
-
-import io
-import os
-import re
-import sqlite3
-import hashlib
-from datetime import datetime, date, timedelta
+mport io, os, re, json, hashlib, sqlite3
 from pathlib import Path
-from typing import Optional
-
+from datetime import datetime, timedelta, timezone, date
 import pandas as pd
+import requests
 import streamlit as st
-
 try:
     import pdfplumber
-except Exception:
-    pdfplumber = None
-
+except Exception: pdfplumber=None
 try:
     from docx import Document
-except Exception:
-    Document = None
+except Exception: Document=None
 
-APP_TITLE = "Executive Job Screener"
-DATA_DIR = Path(os.getenv("APP_DATA_DIR", "data"))
-CV_DIR = DATA_DIR / "cv_versions"
-DB_PATH = Path(os.getenv("APP_DB_PATH", str(DATA_DIR / "job_screener.db")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-CV_DIR.mkdir(parents=True, exist_ok=True)
+st.set_page_config(page_title='Executive Job Screener', page_icon='🎯', layout='wide')
+DATA=Path(os.getenv('APP_DATA_DIR','data')); DATA.mkdir(exist_ok=True); (DATA/'cv_versions').mkdir(exist_ok=True)
+DB=Path(os.getenv('APP_DB_PATH',str(DATA/'jobs.db')))
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🎯", layout="wide")
-
-
-# --------------------------- Database ---------------------------------------
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS cv_versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT NOT NULL,
-            stored_path TEXT NOT NULL,
-            version_label TEXT NOT NULL,
-            uploaded_at TEXT NOT NULL,
-            text_content TEXT,
-            sha256 TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company TEXT NOT NULL,
-            role TEXT NOT NULL,
-            location TEXT DEFAULT '',
-            region TEXT DEFAULT '',
-            industry TEXT DEFAULT '',
-            description TEXT DEFAULT '',
-            job_url TEXT DEFAULT '',
-            source TEXT DEFAULT 'Manual',
-            salary TEXT DEFAULT '',
-            posted_date TEXT DEFAULT '',
-            status TEXT DEFAULT 'Saved',
-            score INTEGER DEFAULT 0,
-            score_reason TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS applications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id INTEGER NOT NULL,
-            cv_version_id INTEGER,
-            applied_at TEXT,
-            status TEXT DEFAULT 'Prepared',
-            cover_letter TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
-            follow_up_date TEXT DEFAULT '',
-            application_url TEXT DEFAULT '',
-            FOREIGN KEY(job_id) REFERENCES jobs(id),
-            FOREIGN KEY(cv_version_id) REFERENCES cv_versions(id)
-        );
-        """)
-        conn.commit()
-
-
-init_db()
-
-
-def query_df(sql: str, params=()) -> pd.DataFrame:
-    with db() as conn:
-        return pd.read_sql_query(sql, conn, params=params)
-
-
-def execute(sql: str, params=()):
-    with db() as conn:
-        conn.execute(sql, params)
-        conn.commit()
-
-
-# --------------------------- CV helpers --------------------------------------
-def extract_text(filename: str, raw: bytes) -> str:
-    suffix = Path(filename).suffix.lower()
-    if suffix == ".pdf" and pdfplumber:
+def conn():
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+def init():
+    with conn() as c:
+        c.executescript('''CREATE TABLE IF NOT EXISTS cvs(id INTEGER PRIMARY KEY,filename TEXT,path TEXT,label TEXT,uploaded TEXT,text TEXT,hash TEXT UNIQUE);
+        CREATE TABLE IF NOT EXISTS profile(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT,updated TEXT);
+        CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,job_key TEXT UNIQUE,company TEXT,role TEXT,location TEXT,market TEXT,description TEXT,url TEXT,source TEXT,posted TEXT,years INTEGER,score INTEGER,reasons TEXT,last_seen TEXT);
+        CREATE TABLE IF NOT EXISTS scans(id INTEGER PRIMARY KEY,at TEXT,sources TEXT,queries TEXT,count INTEGER,notes TEXT);
+        CREATE TABLE IF NOT EXISTS shortlist(id INTEGER PRIMARY KEY,job_key TEXT UNIQUE,status TEXT,notes TEXT,updated TEXT);''')
+def df(sql,params=()):
+    with conn() as c: return pd.read_sql_query(sql,c,params=params)
+def run(sql,params=()):
+    with conn() as c: c.execute(sql,params); c.commit()
+def now(): return datetime.now().astimezone().isoformat(timespec='seconds')
+def secret(k):
+    try: return st.secrets.get(k,os.getenv(k,''))
+    except Exception: return os.getenv(k,'')
+def extract(name,raw):
+    try:
+        if name.lower().endswith('.pdf') and pdfplumber:
+            with pdfplumber.open(io.BytesIO(raw)) as p: return '\n'.join(x.extract_text() or '' for x in p.pages)
+        if name.lower().endswith('.docx') and Document: return '\n'.join(x.text for x in Document(io.BytesIO(raw)).paragraphs)
+        if name.lower().endswith('.txt'): return raw.decode('utf-8',errors='ignore')
+    except Exception: pass
+    return ''
+def profile_from(text):
+    t=text.lower()
+    roles=[]
+    for label,terms in [('CEO / Managing Director',['ceo','chief executive','managing director']),('COO / Operations Head',['coo','chief operating','operations head','service delivery']),('Business Head / P&L Head',['business head','p&l','profit centre','profit center']),('VP / Vice President',['vice president','vp sales','vp operations']),('Sales / Commercial Leadership',['sales','business development','commercial']),('Country / Regional Head',['country head','regional head','international'])]:
+        if any(x in t for x in terms): roles.append(label)
+    industry_terms={'Education / EdTech / K-12':['education','edtech','k-12','school','preschool','learning'],'Enterprise Training / Skilling':['training','skilling','certification'],'IT / SaaS / Technology Services':['saas','software','technology','digital','ict','erp'],'Publishing':['publishing','publisher','books','content'],'B2B Services':['b2b','service delivery','consulting','operations']}
+    industries=[k for k,v in industry_terms.items() if any(x in t for x in v)]
+    skill_terms={'P&L / Business Ownership':['p&l','profit centre','profit center','business head','revenue'],'Sales & Business Development':['sales','business development','acquisition','channel'],'Operations & Service Delivery':['operations','service delivery'],'Team Leadership':['team','leadership','people'],'Partner / Franchise Management':['franchise','partner network','channel partner'],'International Business':['middle east','uae','international','overseas'],'Business Growth / Transformation':['growth','scaled','transformation','turnaround'],'Product / Content / Digital':['product','content','digital','saas','technology']}
+    skills=[k for k,v in skill_terms.items() if any(x in t for x in v)]
+    years=[int(x) for x in re.findall(r'\b(19[89]\d|20[012]\d)\b',text)]
+    years=[x for x in years if 1980<=x<datetime.now().year]
+    exp=max(15,datetime.now().year-min(years)) if years else 15
+    return {'roles':roles or ['VP / Vice President','Business Head / P&L Head','COO / Operations Head'],'industries':industries or list(industry_terms),'skills':skills,'experience_years':min(exp,50),'markets':['India','Middle East','Africa'],'days':90,'min_required':15}
+def get_profile():
+    x=df('SELECT json FROM profile WHERE id=1')
+    return json.loads(x.iloc[0,0]) if not x.empty else None
+def save_profile(p): run('INSERT INTO profile(id,json,updated) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json,updated=excluded.updated',(json.dumps(p),now()))
+ROLE_TERMS={'CEO / Managing Director':['ceo','chief executive','managing director','country manager','general manager'],'COO / Operations Head':['coo','chief operating','operations director','head of operations','service delivery'],'Business Head / P&L Head':['business head','business unit head','p&l','profit and loss','business director','general manager'],'VP / Vice President':['vice president','vp ','vp,','vp-'],'Sales / Commercial Leadership':['sales director','head of sales','commercial director','business development director'],'Country / Regional Head':['country head','country director','regional head','regional director']}
+IND={'Education / EdTech / K-12':['education','edtech','k-12','school','preschool','learning'],'Enterprise Training / Skilling':['training','skilling','certification','corporate learning'],'IT / SaaS / Technology Services':['saas','software','technology services','it services','digital solutions','ict'],'Publishing':['publishing','publisher','books','digital content'],'B2B Services':['b2b','services','consulting','outsourcing','service delivery']}
+MARKETS={'India':['india','mumbai','delhi','bengaluru','bangalore','hyderabad','chennai','pune','gurugram','gurgaon','noida','ahmedabad','kolkata'],'Middle East':['middle east','uae','united arab emirates','dubai','abu dhabi','saudi','riyadh','qatar','doha','oman','muscat','bahrain','kuwait','gcc','jeddah'],'Africa':['africa','kenya','nairobi','nigeria','lagos','south africa','johannesburg','cape town','ghana','egypt','morocco','rwanda','uganda','tanzania']}
+def parse_date(x):
+    try:
+        d=pd.to_datetime(x,utc=True,errors='coerce'); return None if pd.isna(d) else d.to_pydatetime()
+    except Exception:return None
+def market_of(loc,desc=''):
+    l=(loc or '').lower()
+    for m,terms in MARKETS.items():
+        if any(t in l for t in terms): return m
+    return ''
+def req_years(text):
+    vals=[]
+    for p in [r'(\d{1,2})\s*\+?\s*(?:years|yrs)\s+(?:of\s+)?(?:experience|exp)',r'(?:experience|exp)\s+(?:of\s+)?(\d{1,2})\s*\+?\s*(?:years|yrs)',r'minimum\s+of\s+(\d{1,2})\s+(?:years|yrs)']:
+        vals += [int(x) for x in re.findall(p,(text or '').lower())]
+    return max(vals) if vals else None
+def score(title,desc,market,p):
+    t=f'{title} {desc}'.lower(); s=0; reasons=[]
+    if any(any(term in title.lower() for term in ROLE_TERMS.get(r,[r.lower()])) for r in p['roles']): s+=28; reasons.append('Leadership role match')
+    elif any(x in t for x in ['p&l','profit and loss','business unit','revenue growth','operations leadership']): s+=14; reasons.append('Related leadership responsibilities')
+    for i in p['industries']:
+        if any(x in t for x in IND.get(i,[i.lower()])): s+=22; reasons.append('Industry: '+i); break
+    skillterms={'P&L / Business Ownership':['p&l','profit and loss','business ownership','profitability'],'Sales & Business Development':['sales','business development','revenue','commercial'],'Operations & Service Delivery':['operations','service delivery'],'Team Leadership':['team','leadership','people management'],'Partner / Franchise Management':['partner','franchise','channel'],'International Business':['international','global','regional','gcc'],'Business Growth / Transformation':['growth','scale','transformation','turnaround','expansion'],'Product / Content / Digital':['product','content','digital','saas','technology']}
+    hits=sum(1 for sk in p['skills'] if any(x in t for x in skillterms.get(sk,[sk.lower()])))
+    s+=min(25,hits*5)
+    if hits: reasons.append(f'{hits} functional matches')
+    if market in p['markets']: s+=15; reasons.append('Target market: '+market)
+    if any(x in t for x in ['15+ years','15 years','20 years','senior leadership','executive leadership']): s+=8; reasons.append('Senior experience level')
+    return min(100,s),'; '.join(reasons) or 'Keyword overlap; review manually'
+def key_for(j): return hashlib.sha256('|'.join(str(j.get(k,'' )).lower().strip() for k in ['company','title','location','url']).encode()).hexdigest()
+def search_arbeitnow(query):
+    out=[]
+    for page in [1,2,3]:
         try:
-            with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                return "\n".join((p.extract_text() or "") for p in pdf.pages)
-        except Exception:
-            return ""
-    if suffix == ".docx" and Document:
-        try:
-            doc = Document(io.BytesIO(raw))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            return ""
-    if suffix in (".txt", ".md"):
-        return raw.decode("utf-8", errors="ignore")
-    return ""
+            r=requests.get('https://www.arbeitnow.com/api/job-board-api',params={'page':page},timeout=15,headers={'User-Agent':'ExecutiveJobScreener/1.0'}); r.raise_for_status()
+            items=r.json().get('data',[])
+            if not items: break
+            for x in items:
+                searchable=f"{x.get('title','')} {x.get('description','')} {x.get('location','')}".lower()
+                if any(z.lower() in searchable for z in query.split()): out.append({'title':x.get('title',''),'company':x.get('company_name',''),'location':x.get('location',''),'description':re.sub('<[^>]+>',' ',x.get('description','')),'url':x.get('url',''),'posted':x.get('created_at'),'source':'Arbeitnow'})
+        except Exception as e: return out,[f'Arbeitnow: {e}']
+    return out,[]
+def search_adzuna(query,market):
+    aid,akey=secret('ADZUNA_APP_ID'),secret('ADZUNA_APP_KEY')
+    if not aid or not akey:return [],['Adzuna not configured: add ADZUNA_APP_ID and ADZUNA_APP_KEY in Streamlit Secrets.']
+    country={'India':'in','Middle East':'ae','Africa':'za'}.get(market,'in')
+    try:
+        r=requests.get(f'https://api.adzuna.com/v1/api/jobs/{country}/search/1',params={'app_id':aid,'app_key':akey,'results_per_page':50,'what':query,'max_days_old':90,'content-type':'application/json'},timeout=18);r.raise_for_status()
+        return [{'title':x.get('title',''),'company':(x.get('company') or {}).get('display_name',''),'location':(x.get('location') or {}).get('display_name',''),'description':x.get('description',''),'url':x.get('redirect_url',''),'posted':x.get('created'),'source':'Adzuna'} for x in r.json().get('results',[])],[]
+    except Exception as e:return [],[f'Adzuna {market}: {e}']
+def search_jooble(query,market):
+    k=secret('JOOBLE_API_KEY')
+    if not k:return [],['Jooble not configured: add JOOBLE_API_KEY in Streamlit Secrets.']
+    try:
+        r=requests.post(f'https://jooble.org/api/{k}',json={'keywords':query,'location':{'India':'India','Middle East':'United Arab Emirates','Africa':'South Africa'}.get(market,market)},timeout=18);r.raise_for_status()
+        return [{'title':x.get('title',''),'company':x.get('company',''),'location':x.get('location',''),'description':x.get('snippet',''),'url':x.get('link',''),'posted':x.get('updated'),'source':'Jooble'} for x in r.json().get('jobs',[])],[]
+    except Exception as e:return [],[f'Jooble {market}: {e}']
+def queries_for(p):
+    q=[x.replace(' / ',' ') for x in p['roles']]+[x.replace(' / ',' ') for x in p['industries'][:3]]+['business head P&L','COO operations','VP business growth','CEO managing director']
+    return list(dict.fromkeys(q))[:8]
+def scan(p):
+    qs=queries_for(p); raw=[]; notes=[]
+    # Public feed has limited geographic coverage; API providers broaden results.
+    for q in qs[:4]:
+        x,n=search_arbeitnow(q);raw+=x;notes+=n
+    for m in p['markets']:
+        for q in qs[:3]:
+            x,n=search_adzuna(q,m);raw+=x;notes+=n
+        for q in qs[:2]:
+            x,n=search_jooble(q,m);raw+=x;notes+=n
+    unique={}
+    for j in raw: unique[key_for(j)]=j
+    cutoff=datetime.now(timezone.utc)-timedelta(days=int(p['days'])); matched=[]
+    for j in unique.values():
+        d=parse_date(j.get('posted'))
+        if not d or d<cutoff: continue
+        loc=j.get('location',''); market=market_of(loc,j.get('description',''))
+        if market not in p['markets']: continue
+        yr=req_years(j.get('title','')+' '+j.get('description',''))
+        if yr is not None and yr<int(p['min_required']): continue
+        sc,why=score(j.get('title',''),j.get('description',''),market,p)
+        if sc<28: continue
+        j.update({'key':key_for(j),'market':market,'posted_date':d.date().isoformat(),'years':yr,'score':sc,'reasons':why})
+        matched.append(j)
+    for j in matched:
+        run('''INSERT INTO jobs(job_key,company,role,location,market,description,url,source,posted,years,score,reasons,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(job_key) DO UPDATE SET company=excluded.company,role=excluded.role,location=excluded.location,market=excluded.market,description=excluded.description,url=excluded.url,source=excluded.source,posted=excluded.posted,years=excluded.years,score=excluded.score,reasons=excluded.reasons,last_seen=excluded.last_seen''',
+        (j['key'],j.get('company','Company not listed'),j.get('title',''),j.get('location',''),j['market'],j.get('description','')[:12000],j.get('url',''),j.get('source',''),j['posted_date'],j['years'],j['score'],j['reasons'],now()))
+    # Expire old jobs but retain historical records.
+    run('DELETE FROM jobs WHERE posted < ?',((datetime.now(timezone.utc)-timedelta(days=int(p['days']))).date().isoformat(),))
+    run('INSERT INTO scans(at,sources,queries,count,notes) VALUES(?,?,?,?,?)',(now(),'Arbeitnow, Adzuna, Jooble',json.dumps(qs),len(matched),' | '.join(dict.fromkeys(notes))[:4000]))
+    return len(matched),notes,qs
 
-
-def save_cv(uploaded_file, version_label: str):
-    raw = uploaded_file.getvalue()
-    digest = hashlib.sha256(raw).hexdigest()
-    # Avoid duplicate versions for identical files.
-    existing = query_df("SELECT id FROM cv_versions WHERE sha256=?", (digest,))
-    if not existing.empty:
-        return int(existing.iloc[0]["id"]), "This exact file is already stored."
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", uploaded_file.name)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = CV_DIR / f"{stamp}_{safe_name}"
-    path.write_bytes(raw)
-    text = extract_text(uploaded_file.name, raw)
-    execute(
-        """INSERT INTO cv_versions(filename, stored_path, version_label, uploaded_at,
-           text_content, sha256) VALUES(?,?,?,?,?,?)""",
-        (uploaded_file.name, str(path), version_label, datetime.now().isoformat(timespec="seconds"),
-         text, digest),
-    )
-    row = query_df("SELECT id FROM cv_versions WHERE sha256=?", (digest,))
-    return int(row.iloc[0]["id"]), "CV version stored."
-
-
-def get_cv_bytes(cv_id: int) -> Optional[bytes]:
-    row = query_df("SELECT stored_path FROM cv_versions WHERE id=?", (cv_id,))
-    if row.empty:
-        return None
-    path = Path(row.iloc[0]["stored_path"])
-    return path.read_bytes() if path.exists() else None
-
-
-# --------------------------- Job scoring -------------------------------------
-ROLE_TERMS = {
-    "COO": ["coo", "chief operating officer", "operations head", "operations director"],
-    "Business Head": ["business head", "business unit head", "business director", "p&l head", "profit centre"],
-    "VP": ["vice president", "vp ", "vp,", "vp-"],
-    "CEO": ["ceo", "chief executive officer", "managing director", "md "],
-}
-INDUSTRY_TERMS = {
-    "Education / EdTech": ["education", "edtech", "school", "k-12", "publishing", "learning"],
-    "Enterprise Training / Skilling": ["training", "skilling", "certification", "workforce learning"],
-    "IT / SaaS / Technology Services": ["saas", "software", "technology services", "it services", "digital"],
-    "B2B Services": ["b2b", "services", "outsourcing", "consulting"],
-}
-GEO_TERMS = ["india", "middle east", "uae", "saudi", "qatar", "oman", "bahrain",
-             "kuwait", "africa", "kenya", "nigeria", "south africa", "remote"]
-
-
-def score_job(role: str, description: str, industry: str, region: str) -> tuple[int, str]:
-    text = f"{role} {description}".lower()
-    score = 0
-    reasons = []
-    for group, terms in ROLE_TERMS.items():
-        if any(t in text for t in terms):
-            score += 25
-            reasons.append(f"Leadership match: {group}")
-            break
-    for group, terms in INDUSTRY_TERMS.items():
-        if industry and industry.lower() == group.lower():
-            score += 25
-            reasons.append(f"Industry match: {group}")
-            break
-        if any(t in text for t in terms):
-            score += 18
-            reasons.append(f"Relevant sector: {group}")
-            break
-    if any(t in (region + " " + text).lower() for t in GEO_TERMS):
-        score += 15
-        reasons.append("Target geography")
-    if any(t in text for t in ["p&l", "profit and loss", "revenue responsibility", "business ownership"]):
-        score += 15
-        reasons.append("P&L / business ownership")
-    if any(t in text for t in ["transformation", "scale", "growth", "turnaround", "build"]):
-        score += 10
-        reasons.append("Growth / transformation mandate")
-    if any(t in text for t in ["team of", "leadership team", "multiple functions", "cross-functional"]):
-        score += 10
-        reasons.append("Leadership scope")
-    return min(score, 100), "; ".join(reasons) or "Limited keyword evidence; review manually."
-
-
-def make_cover_letter(company: str, role: str, description: str = "") -> str:
-    return f"""Dear Hiring Team,
-
-I am writing to express my interest in the {role} opportunity at {company}.
-
-I bring extensive leadership experience across business growth, P&L ownership, sales and operations, service delivery, and team development in education, technology-enabled services, and B2B environments. My experience includes building and scaling businesses, strengthening customer and partner relationships, and aligning commercial priorities with operational execution.
-
-The opportunity to contribute to {company}'s next stage of growth is of particular interest. I would welcome a discussion on how my background could support the organisation's objectives.
-
-Regards,
-Naveen Kundu
-"""
-
-
-# --------------------------- UI ----------------------------------------------
-st.title("🎯 Executive Job Screener")
-st.caption("Job discovery • CV versions • application preparation • application tracking")
-
-with st.sidebar:
-    st.header("Navigation")
-    page = st.radio("Open", ["Dashboard", "CV Manager", "Jobs", "Application Centre", "Settings"])
-    st.divider()
-    st.caption("Private MVP: keep your CV and database in a secure, persistent storage environment.")
-
-if page == "Dashboard":
-    jobs = query_df("SELECT * FROM jobs ORDER BY score DESC, created_at DESC")
-    apps = query_df("SELECT * FROM applications")
-    cvs = query_df("SELECT * FROM cv_versions")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Saved jobs", len(jobs))
-    c2.metric("Applications", len(apps))
-    c3.metric("CV versions", len(cvs))
-    c4.metric("High-fit roles", int((jobs["score"] >= 70).sum()) if not jobs.empty else 0)
-    st.subheader("Highest-fit opportunities")
-    if jobs.empty:
-        st.info("Add jobs in the Jobs tab or import a CSV.")
-    else:
-        st.dataframe(jobs[["company", "role", "location", "score", "status"]].head(10),
-                     use_container_width=True, hide_index=True)
-    st.subheader("Recent applications")
-    if apps.empty:
-        st.info("Prepared or submitted applications will appear here.")
-    else:
-        st.dataframe(query_df("""
-            SELECT a.id, j.company, j.role, a.status, a.applied_at, a.follow_up_date
-            FROM applications a JOIN jobs j ON j.id=a.job_id
-            ORDER BY a.id DESC LIMIT 10
-        """), use_container_width=True, hide_index=True)
-
-elif page == "CV Manager":
-    st.subheader("CV versions")
-    st.write("Upload your CV and keep dated versions. The app retains the original file and extracted text when available.")
-    with st.form("cv_upload_form"):
-        file = st.file_uploader("Upload CV (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
-        label = st.text_input("Version label", value=f"Base CV - {date.today().isoformat()}")
-        submitted = st.form_submit_button("Save CV version")
-    if submitted:
-        if not file:
-            st.error("Please select a CV file.")
+init()
+st.title('🎯 Executive Job Screener')
+st.caption('CV-driven automatic job discovery • India • Middle East • Africa • Vacancies up to 90 days old')
+page=st.sidebar.radio('Navigation',['Dashboard & Scan','CV & Profile','Shortlist','Scan History','Setup'])
+p=get_profile()
+if page=='CV & Profile':
+    st.subheader('Upload CV and extract search profile')
+    f=st.file_uploader('CV file (PDF, DOCX, TXT)',type=['pdf','docx','txt']); label=st.text_input('CV version label',value=f'CV {date.today().isoformat()}')
+    if st.button('Save CV and extract profile'):
+        if not f: st.error('Choose a CV first.')
         else:
-            cv_id, message = save_cv(file, label.strip() or "CV")
-            st.success(f"{message} Version ID: {cv_id}")
-    cv_df = query_df("SELECT id, filename, version_label, uploaded_at FROM cv_versions ORDER BY id DESC")
-    if not cv_df.empty:
-        st.dataframe(cv_df, use_container_width=True, hide_index=True)
-        cv_id = st.selectbox("Download stored CV", cv_df["id"].tolist(), format_func=lambda x: f"Version {x}")
-        data = get_cv_bytes(int(cv_id))
-        if data:
-            fname = cv_df.loc[cv_df["id"] == cv_id, "filename"].iloc[0]
-            st.download_button("Download selected CV", data, file_name=fname)
+            raw=f.getvalue(); digest=hashlib.sha256(raw).hexdigest(); existing=df('SELECT id FROM cvs WHERE hash=?',(digest,))
+            if existing.empty:
+                safe=re.sub(r'[^A-Za-z0-9._-]+','_',f.name); path=DATA/'cv_versions'/f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{safe}';path.write_bytes(raw)
+                text=extract(f.name,raw)
+                run('INSERT INTO cvs(filename,path,label,uploaded,text,hash) VALUES(?,?,?,?,?,?)',(f.name,str(path),label,now(),text,digest))
+            else: text=df('SELECT text FROM cvs WHERE id=?',(int(existing.iloc[0,0]),)).iloc[0,0]
+            if not text.strip(): st.error('CV stored, but text extraction failed. Try a text-based PDF or DOCX.')
+            else: save_profile(profile_from(text)); st.success('CV saved and search profile extracted. Review the profile below.'); st.rerun()
+    cvs=df('SELECT id,filename,label,uploaded FROM cvs ORDER BY id DESC')
+    if not cvs.empty:
+        st.dataframe(cvs,use_container_width=True,hide_index=True)
+        cid=st.selectbox('Download CV version',cvs.id.tolist()); row=df('SELECT path,filename FROM cvs WHERE id=?',(int(cid),)).iloc[0]
+        if Path(row.path).exists(): st.download_button('Download CV',Path(row.path).read_bytes(),file_name=row.filename)
+    if p:
+        with st.form('profile_edit'):
+            roles=st.multiselect('Positions',list(ROLE_TERMS),default=[x for x in p['roles'] if x in ROLE_TERMS])
+            industries=st.multiselect('Industries',list(IND),default=[x for x in p['industries'] if x in IND])
+            skills=st.multiselect('Capabilities',['P&L / Business Ownership','Sales & Business Development','Operations & Service Delivery','Team Leadership','Partner / Franchise Management','International Business','Business Growth / Transformation','Product / Content / Digital'],default=p['skills'])
+            markets=st.multiselect('Markets',['India','Middle East','Africa'],default=p['markets'])
+            exp=st.number_input('Your total experience (years)',15,50,int(max(15,min(50,p['experience_years']))))
+            minreq=st.number_input('Minimum advertised experience requirement',15,40,int(p['min_required']))
+            days=st.slider('Maximum vacancy age (days)',1,90,int(p['days']))
+            ok=st.form_submit_button('Save profile')
+        if ok:
+            p.update(roles=roles,industries=industries,skills=skills,markets=markets,experience_years=exp,min_required=minreq,days=days);save_profile(p);st.success('Profile saved.');st.rerun()
+    else: st.info('Upload your CV to begin.')
+elif page=='Dashboard & Scan':
+    if not p: st.warning('Open CV & Profile and upload your CV first.');st.stop()
+    jobs=df('SELECT * FROM jobs ORDER BY score DESC,posted DESC')
+    a,b,c,d=st.columns(4);a.metric('Matching jobs',len(jobs));b.metric('Markets',len(p['markets']));c.metric('Experience filter',f"{p['min_required']}+ years");d.metric('Posting window',f"{p['days']} days")
+    st.write('Every scan searches configured sources, excludes postings older than the selected window, re-scores matches, and refreshes saved listings.')
+    if st.button('🔄 Scan for new and refreshed jobs',type='primary',use_container_width=True):
+        with st.spinner('Scanning available job sources and matching your CV profile…'): n,notes,qs=scan(p)
+        st.success(f'Scan complete: {n} matching listings found or refreshed.');st.write('Search queries:',', '.join(qs))
+        for note in dict.fromkeys(notes): st.caption(note)
+        st.rerun()
+    hist=df('SELECT at,count FROM scans ORDER BY id DESC LIMIT 1')
+    if not hist.empty: st.caption(f"Last scan: {hist.iloc[0]['at']} • matches: {hist.iloc[0]['count']}")
+    jobs=df('SELECT * FROM jobs ORDER BY score DESC,posted DESC')
+    if jobs.empty: st.info('No scan has returned matching jobs yet. Configure Adzuna/Jooble keys in Setup to broaden coverage, then scan.')
     else:
-        st.info("No CV uploaded yet.")
-
-elif page == "Jobs":
-    st.subheader("Add a job")
-    with st.form("job_form"):
-        col1, col2 = st.columns(2)
-        company = col1.text_input("Company *")
-        role = col2.text_input("Role *")
-        location = col1.text_input("Location")
-        region = col2.selectbox("Market", ["India", "Middle East", "Africa", "Global / Remote", "Other"])
-        industry = st.selectbox("Industry", [
-            "Education / EdTech", "Enterprise Training / Skilling",
-            "IT / SaaS / Technology Services", "Publishing / K-12", "B2B Services", "Other"
-        ])
-        url = st.text_input("Job URL")
-        salary = st.text_input("Compensation (optional)")
-        desc = st.text_area("Job description", height=180)
-        save_job = st.form_submit_button("Save and score job")
-    if save_job:
-        if not company.strip() or not role.strip():
-            st.error("Company and role are required.")
-        else:
-            score, reason = score_job(role, desc, industry, region)
-            execute("""INSERT INTO jobs(company, role, location, region, industry, description,
-                      job_url, salary, score, score_reason, created_at)
-                      VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (company.strip(), role.strip(), location, region, industry, desc, url, salary,
-                     score, reason, datetime.now().isoformat(timespec="seconds")))
-            st.success(f"Job saved. Fit score: {score}/100")
-            st.caption(reason)
-
-    st.divider()
-    st.subheader("Import jobs from CSV")
-    st.caption("Expected columns: company, role. Optional: location, region, industry, description, job_url, salary, posted_date.")
-    csv_file = st.file_uploader("Choose job CSV", type=["csv"], key="jobs_csv")
-    if csv_file:
-        data = pd.read_csv(csv_file).fillna("")
-        st.dataframe(data.head(), use_container_width=True)
-        if st.button("Import CSV jobs"):
-            count = 0
-            for _, r in data.iterrows():
-                comp, rol = str(r.get("company", "")).strip(), str(r.get("role", "")).strip()
-                if not comp or not rol:
-                    continue
-                desc = str(r.get("description", ""))
-                industry = str(r.get("industry", ""))
-                region = str(r.get("region", ""))
-                score, reason = score_job(rol, desc, industry, region)
-                execute("""INSERT INTO jobs(company, role, location, region, industry, description,
-                          job_url, salary, posted_date, score, score_reason, created_at)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (comp, rol, str(r.get("location", "")), region, industry, desc,
-                         str(r.get("job_url", "")), str(r.get("salary", "")),
-                         str(r.get("posted_date", "")), score, reason,
-                         datetime.now().isoformat(timespec="seconds")))
-                count += 1
-            st.success(f"Imported {count} jobs.")
-
-    jobs = query_df("SELECT * FROM jobs ORDER BY score DESC, id DESC")
-    if not jobs.empty:
-        st.subheader("Saved jobs")
-        st.dataframe(jobs[["id", "company", "role", "location", "industry", "score", "status", "job_url"]],
-                     use_container_width=True, hide_index=True)
-        job_id = st.selectbox("Select job to update", jobs["id"].tolist())
-        new_status = st.selectbox("Job status", ["Saved", "Shortlisted", "Preparing", "Applied", "Interview", "Offer", "Rejected", "Closed"])
-        if st.button("Update job status"):
-            execute("UPDATE jobs SET status=? WHERE id=?", (new_status, int(job_id)))
-            st.success("Status updated.")
-
-elif page == "Application Centre":
-    st.subheader("Prepare and manage applications")
-    jobs = query_df("SELECT id, company, role, job_url FROM jobs ORDER BY score DESC, id DESC")
-    cvs = query_df("SELECT id, filename, version_label FROM cv_versions ORDER BY id DESC")
-    if jobs.empty:
-        st.info("Save a job first in the Jobs tab.")
-    else:
-        selected_job = st.selectbox("Choose job", jobs["id"].tolist(),
-            format_func=lambda x: f"{jobs.loc[jobs.id == x, 'company'].iloc[0]} — {jobs.loc[jobs.id == x, 'role'].iloc[0]}")
-        job_row = jobs[jobs.id == selected_job].iloc[0]
-        cv_id = st.selectbox("CV version", cvs["id"].tolist() if not cvs.empty else [None],
-            format_func=lambda x: (f"Version {x}: " + str(cvs.loc[cvs.id == x, "version_label"].iloc[0])) if x is not None and not cvs.empty else "No CV stored")
-        cover = st.text_area("Cover letter / application message",
-                             value=make_cover_letter(job_row["company"], job_row["role"]), height=260)
-        app_url = st.text_input("Application URL", value=str(job_row["job_url"] or ""))
-        st.caption("Review the CV and message before sending. This MVP prepares and tracks applications; it does not automate restricted third-party forms.")
-        cv_bytes = get_cv_bytes(int(cv_id)) if cv_id is not None else None
-        if cv_bytes:
-            cv_filename = cvs.loc[cvs.id == cv_id, "filename"].iloc[0]
-            st.download_button("Download CV for this application", cv_bytes, file_name=cv_filename)
-        st.download_button("Download cover letter", cover, file_name="cover_letter.txt")
-        col_a, col_b = st.columns(2)
-        if app_url and col_a.button("Open application page"):
-            st.link_button("Continue on employer site", app_url)
-        if col_b.button("Save application as Prepared"):
-            execute("""INSERT INTO applications(job_id, cv_version_id, status, cover_letter,
-                      application_url, notes) VALUES(?,?,?,?,?,?)""",
-                    (int(selected_job), int(cv_id) if cv_id is not None else None,
-                     "Prepared", cover, app_url, "Prepared in Streamlit; final submission may be external."))
-            st.success("Application saved as Prepared.")
-        st.divider()
-        st.subheader("Mark an application as submitted")
-        app_records = query_df("""
-            SELECT a.id, j.company, j.role, a.status
-            FROM applications a JOIN jobs j ON j.id=a.job_id ORDER BY a.id DESC
-        """)
-        if not app_records.empty:
-            app_id = st.selectbox("Application record", app_records["id"].tolist(),
-                format_func=lambda x: f"#{x} — {app_records.loc[app_records.id == x, 'company'].iloc[0]} / {app_records.loc[app_records.id == x, 'role'].iloc[0]}")
-            app_status = st.selectbox("Update application status", ["Prepared", "Applied", "Interview", "Offer", "Rejected", "Withdrawn"])
-            followup = st.date_input("Follow-up date", value=date.today() + timedelta(days=7))
-            notes = st.text_area("Application notes", placeholder="Confirmation number, recruiter, next steps...")
-            if st.button("Save application update"):
-                applied_at = datetime.now().isoformat(timespec="seconds") if app_status == "Applied" else None
-                execute("UPDATE applications SET status=?, applied_at=COALESCE(?, applied_at), follow_up_date=?, notes=? WHERE id=?",
-                        (app_status, applied_at, followup.isoformat(), notes, int(app_id)))
-                st.success("Application record updated.")
-
-    apps = query_df("""
-        SELECT a.id, j.company, j.role, a.status, a.applied_at, a.follow_up_date, a.notes
-        FROM applications a JOIN jobs j ON j.id=a.job_id ORDER BY a.id DESC
-    """)
-    if not apps.empty:
-        st.subheader("Application tracker")
-        st.dataframe(apps, use_container_width=True, hide_index=True)
-        st.download_button("Export application tracker CSV", apps.to_csv(index=False).encode("utf-8"),
-                           file_name="application_tracker.csv", mime="text/csv")
-
-elif page == "Settings":
-    st.subheader("Settings and data portability")
-    st.write(f"Database path: `{DB_PATH}`")
-    st.write(f"CV storage path: `{CV_DIR}`")
-    st.warning("On Streamlit Community Cloud, local files may not be durable across app restarts or redeployments. For persistent private storage, use a managed database and private object storage.")
-    all_jobs = query_df("SELECT * FROM jobs")
-    all_apps = query_df("SELECT * FROM applications")
-    all_cvs = query_df("SELECT id, filename, version_label, uploaded_at FROM cv_versions")
-    st.download_button("Export jobs CSV", all_jobs.to_csv(index=False).encode("utf-8"),
-                       file_name="jobs_export.csv", mime="text/csv")
-    st.download_button("Export applications CSV", all_apps.to_csv(index=False).encode("utf-8"),
-                       file_name="applications_export.csv", mime="text/csv")
-    st.download_button("Export CV version index CSV", all_cvs.to_csv(index=False).encode("utf-8"),
-                       file_name="cv_index.csv", mime="text/csv")
-
-st.caption("Executive Job Screener MVP • Review every application before submission.")
+        m=st.multiselect('Market filter',['India','Middle East','Africa'],default=p['markets']); minscore=st.slider('Minimum CV match score',0,100,30,5); src=st.multiselect('Source filter',sorted(jobs.source.dropna().unique()))
+        v=jobs[jobs.market.isin(m)&(jobs.score>=minscore)]
+        if src:v=v[v.source.isin(src)]
+        st.caption(f'{len(v)} jobs displayed. Unknown or stale posting dates are excluded.')
+        for _,r in v.iterrows():
+            with st.container(border=True):
+                left,right=st.columns([5,1]);left.markdown(f"**{r.role}** — {r.company}");left.caption(f"{r.location} • {r.market} • Posted {r.posted} • {r.source}");left.write(r.reasons)
+                with left.expander('Description'): st.write((r.description or '')[:5000])
+                right.metric('CV match',f'{r.score}%')
+                if r.url: right.link_button('View job',r.url,use_container_width=True)
+                if right.button('Shortlist',key=f'short-{r.id}'):
+                    run('INSERT INTO shortlist(job_key,status,notes,updated) VALUES(?,?,?,?) ON CONFLICT(job_key) DO UPDATE SET status=excluded.status,updated=excluded.updated',(r.job_key,'Shortlisted','',now()));st.toast('Shortlisted')
+        st.download_button('Export matching jobs CSV',v.to_csv(index=False).encode(),file_name='matching_jobs.csv',mime='text/csv')
+elif page=='Shortlist':
+    s=df('SELECT s.status,s.notes,s.updated,j.company,j.role,j.location,j.market,j.score,j.posted,j.url FROM shortlist s LEFT JOIN jobs j ON s.job_key=j.job_key ORDER BY s.updated DESC')
+    st.subheader('Shortlisted jobs');st.dataframe(s,use_container_width=True,hide_index=True) if not s.empty else st.info('Shortlist jobs from the dashboard.')
+    if not s.empty:
+        st.download_button('Export shortlist CSV',s.to_csv(index=False).encode(),file_name='shortlist.csv',mime='text/csv')
+elif page=='Scan History':
+    h=df('SELECT * FROM scans ORDER BY id DESC LIMIT 100');st.dataframe(h,use_container_width=True,hide_index=True) if not h.empty else st.info('No scans yet.')
+elif page=='Setup':
+    st.subheader('Job source configuration')
+    st.markdown('**Arbeitnow** is attempted without a key, but coverage in your target markets may be limited. Configure Adzuna and Jooble for broader discovery.')
+    st.code('ADZUNA_APP_ID = "your_app_id"\nADZUNA_APP_KEY = "your_app_key"\nJOOBLE_API_KEY = "your_jooble_key"',language='toml')
+    st.markdown('In Streamlit Cloud, open app menu → Settings → Secrets. Do not put API keys in GitHub code.')
+    st.warning('This version searches when you click Scan. A Streamlit app does not run scans while asleep; scheduled scanning needs a separate scheduler. Local files/SQLite may be ephemeral on Streamlit Cloud. Use persistent private storage for long-term CV and application records.')
+    st.caption('Adzuna maps India to India, Middle East to UAE, and Africa to South Africa as representative search locations; this is not full country-by-country coverage. Job match scores are heuristic, not guarantees.')
+st.caption('Review job details, employer requirements and posting dates before applying. This app does not automatically submit third-party applications.')
